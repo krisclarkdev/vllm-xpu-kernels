@@ -66,8 +66,8 @@ class batched_moe_align_block_size_kernel {
     int32_t* temp_storage = static_cast<int32_t*>(
         slm.template get_multi_ptr<sycl::access::decorated::no>().get());
 
-    // TODO: This is a naive implementation. Could be optimized.
-
+    // Coalesced init + per-batch fill. Init is striped across the WG so
+    // stores hit consecutive ints; fill stays per-batch after the scan.
     size_t const batch_id = local_id_x;
     size_t const stride = local_range_x * group_range_x;
     int32_t const num_blocks_per_batch =
@@ -77,14 +77,16 @@ class batched_moe_align_block_size_kernel {
     int32_t const block_ids_size = sorted_ids_size / block_size;
     int32_t const SENTINEL =
         num_batches * max_tokens_per_batch;  // To denote invalid entries.
-    // Initialize sorted_ids
+
+    // Vector-friendly striped initialization (coalesced across threads).
     for (size_t i = local_id_x; i < sorted_ids_size; i += stride) {
       sorted_ids[i] = SENTINEL;
     }
-    // Initialize expert_ids with -1
     for (size_t i = local_id_x; i < block_ids_size; i += stride) {
       block_ids[i] = -1;
     }
+    // Ensure inits land before any batch writes below.
+    item.barrier(sycl::access::fence_space::global_and_local);
 
     int32_t b_num_tokens = 0;
     if (batch_id < num_batches) {
@@ -117,14 +119,17 @@ class batched_moe_align_block_size_kernel {
 
     if (batch_id < num_batches) {
       int32_t const batch_offset = batch_id * max_tokens_per_batch;
-      for (size_t i = 0; i < b_num_tokens; ++i) {
-        sorted_ids[cumsum_val + i] = batch_offset + i;
+      // Unroll-friendly contiguous fill for this batch's range.
+      int32_t* __restrict__ dst = sorted_ids + cumsum_val;
+      for (int32_t i = 0; i < b_num_tokens; ++i) {
+        dst[i] = batch_offset + i;
       }
 
       int32_t const block_start = cumsum_val / block_size;
       int32_t const num_blocks = ceil_b_num_tokens / block_size;
-      for (size_t i = 0; i < num_blocks; ++i) {
-        block_ids[block_start + i] = batch_id;
+      int32_t* __restrict__ bdst = block_ids + block_start;
+      for (int32_t i = 0; i < num_blocks; ++i) {
+        bdst[i] = static_cast<int32_t>(batch_id);
       }
     }
   }
