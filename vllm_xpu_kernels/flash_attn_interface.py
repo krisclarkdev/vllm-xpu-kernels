@@ -590,17 +590,26 @@ def flash_attn_varlen_func(
         except RuntimeError as e:
             if "not compiled" not in str(e):
                 raise
-            # Fallback to PyTorch reference implementation.
+            # Fallback to PyTorch reference implementation unless fail-closed.
             import logging
+            import os
             logger = logging.getLogger(__name__)
-            logger.warning(
+            fail_closed = os.environ.get(
+                "VLLM_XPU_ATTN_FAIL_ON_FALLBACK", "0").strip().upper() in (
+                    "1", "ON", "TRUE", "YES", "Y")
+            msg = (
                 "XPU kernel not compiled for this config, falling back "
                 "to PyTorch reference attention. Performance will be "
                 "significantly degraded.\n"
                 "To fix: rebuild with the config line shown above.\n"
                 "If this is unexpected, report at: "
                 "https://github.com/vllm-project/vllm-xpu-kernels/issues/364\n"
-                "Original error: %s", e)
+                "Original error: %s")
+            if fail_closed:
+                raise RuntimeError(
+                    "VLLM_XPU_ATTN_FAIL_ON_FALLBACK=1: refusing PyTorch "
+                    "attention fallback. " + (msg % e)) from e
+            logger.warning(msg, e)
             out, softmax_lse = _fallback_varlen_attn(
                 q, k, v, cu_seqlens_q, cu_seqlens_k, seqused_k,
                 block_table, softmax_scale, causal,
