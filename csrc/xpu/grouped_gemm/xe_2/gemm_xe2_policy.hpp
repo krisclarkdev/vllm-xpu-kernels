@@ -11,14 +11,17 @@ class xe_gemm_policy_base {
   using WGTile = Shape<_256, _256, _32>;
   using SGLayout = Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>;
 
-  // Copy can be turned for better performance
-  using GmemTiledCopyA = void;  // same as make_block_2d_copy_A
-  using GmemTiledCopyB = void;  // same as make_block_2d_copy_B
-  using GmemTiledCopyD = void;  // same as make_block_2d_copy_D
+  // Default: generic copies. Large policies override with Xe2 2D block loads.
+  using GmemTiledCopyA = void;
+  using GmemTiledCopyB = void;
+  using GmemTiledCopyD = void;
 };
 
 class w16a16_policy : public xe_gemm_policy_base {
  public:
+  // 2D block loads improve BW for large expert tiles (decode-M uses m_*).
+  using GmemTiledCopyA = XE_LOAD_2D<16, 32, 32>;
+  using GmemTiledCopyB = XE_LOAD_2D_VNNI<16, 32, 32>;
   using GmemTiledCopyD = XE_STORE_2D<16, 8, 32>;
 };
 
@@ -57,6 +60,8 @@ class w8a16_policy : public xe_gemm_policy_base {
   using WGTile = Shape<_128, _128, _16>;
   using SGLayout = Layout<Shape<_4, _2, _1>, Stride<_2, _1, _0>>;
 
+  using GmemTiledCopyA = XE_LOAD_2D<16, 32, 16>;
+  using GmemTiledCopyB = XE_LOAD_2D_VNNI<16, 32, 16>;
   using GmemTiledCopyD = XE_STORE_2D<16, 8, 32>;
 };
 
@@ -83,6 +88,8 @@ class w4a16_policy : public xe_gemm_policy_base {
   using WGTile = Shape<_128, _256, _32>;
   using SGLayout = Layout<Shape<_4, _8, _1>, Stride<_8, _1, _0>>;
 
+  using GmemTiledCopyA = XE_LOAD_2D<16, 32, 32>;
+  using GmemTiledCopyB = XE_LOAD_2D_VNNI<16, 32, 32>;
   using GmemTiledCopyD = XE_STORE_2D<16, 8, 32>;
 };
 
