@@ -530,11 +530,18 @@ def flash_attn_varlen_func(
             )
 
         # Compute per-seq splits and work_list on host, upload to device.
-        # Only enable for decode (max_seqlen_q == 1) with paged KV cache,
-        # multi-seq batches, and global num_splits_kv > 1.
+        # Enable for decode (max_seqlen_q == 1) with paged KV cache and
+        # global num_splits_kv > 1. Prefer explicit host_kv_lens; otherwise
+        # derive from seqused_k so compact-grid is not dead for callers that
+        # only pass device lengths.
         splits_per_seq_dev = None
         work_list_dev = None
-        if (block_table is not None and host_kv_lens is not None
+        plan_kv_lens = host_kv_lens
+        if (plan_kv_lens is None and seqused_k is not None
+                and block_table is not None and max_seqlen_q == 1
+                and num_splits_kv is not None and num_splits_kv > 1):
+            plan_kv_lens = seqused_k.detach().to(device="cpu")
+        if (block_table is not None and plan_kv_lens is not None
                 and num_splits_kv is not None and num_splits_kv > 1
                 and max_seqlen_q == 1):
             block_size = k.size(1)
@@ -542,7 +549,7 @@ def flash_attn_varlen_func(
             num_xe_cores = _infer_num_xe_cores(q.device)
             num_heads_kv = k.size(2)
             splits_cpu, work_list_cpu = build_decode_split_plan(
-                host_kv_lens,
+                plan_kv_lens,
                 kv_tile=kv_tile,
                 num_kv_splits=num_splits_kv,
                 num_xe_cores=num_xe_cores,
