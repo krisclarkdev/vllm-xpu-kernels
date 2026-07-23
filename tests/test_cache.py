@@ -39,7 +39,9 @@ DEVICES = [
     f"xpu:{i}" for i in range(1 if torch.xpu.device_count() == 1 else 2)
 ]
 
-KV_CACHE_DTYPE = ["auto"]  # FIXME: will add "fp8" when accuracy is improved
+# Enable fp8 in the default matrix; tests that need tighter tolerances
+# should override locally. Keep KV_CACHE_DTYPE_ALL for exhaustive runs.
+KV_CACHE_DTYPE = ["auto", "fp8"]
 KV_CACHE_DTYPE_ALL = ["auto", "fp8"]
 
 # For now, disable "test_aot_dispatch_dynamic" since there are some
