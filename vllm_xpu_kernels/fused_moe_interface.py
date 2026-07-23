@@ -17,16 +17,39 @@ from .moe_utils import quant_act_xpu, ref_fused_moe
 
 REF_FUSED_MOE_ENV = "VLLM_XPU_FUSED_MOE_USE_REF"
 USE_MXFP4_FP8_ENV = "VLLM_XPU_FUSED_MOE_USE_MXFP4_FP8"
+# Prefer native grouped-GEMM MoE for block-FP8 instead of Python ref.
+NATIVE_BLOCK_FP8_ENV = "VLLM_XPU_FUSED_MOE_NATIVE_BLOCK_FP8"
+# MxFP8 still lacks a validated native scale path; keep ref unless forced.
+NATIVE_MXFP8_ENV = "VLLM_XPU_FUSED_MOE_NATIVE_MXFP8"
 
 def _is_env_enabled(env_name: str, default: str = "0") -> bool:
     value = os.environ.get(env_name, default).strip().upper()
     return value in ("1", "ON", "TRUE", "YES", "Y")
 
 
-def _should_use_ref_fused_moe(is_mxfp8: bool, is_block_fp8: bool) -> bool:  
-    if is_mxfp8 or is_block_fp8:
+def _should_use_ref_fused_moe(is_mxfp8: bool, is_block_fp8: bool) -> bool:
+    """Return True when the slow Python ref path must be used.
+
+    Block-FP8 defaults to the native Xe2 grouped-GEMM pipeline (same as
+    tensor FP8) because scales are already threaded through
+    cutlass_grouped_gemm_interface. Override with
+    VLLM_XPU_FUSED_MOE_USE_REF=1 to force the reference.
+
+    MxFP8 stays on the reference path until native E8M0 scale support is
+    validated; set VLLM_XPU_FUSED_MOE_NATIVE_MXFP8=1 to experiment.
+    """
+    if _is_env_enabled(REF_FUSED_MOE_ENV):
         return True
-    return _is_env_enabled(REF_FUSED_MOE_ENV)
+    if is_mxfp8:
+        return not _is_env_enabled(NATIVE_MXFP8_ENV)
+    if is_block_fp8:
+        # Default native; allow forcing ref via REF env above, or disable
+        # native explicitly with NATIVE_BLOCK_FP8=0.
+        if os.environ.get(NATIVE_BLOCK_FP8_ENV, "1").strip().upper() in (
+                "0", "OFF", "FALSE", "NO", "N"):
+            return True
+        return False
+    return False
 
 
 def _get_recipe(is_fp8, is_mxfp8, is_mxfp4, is_int4, is_block_fp8):
@@ -461,7 +484,7 @@ def xpu_fused_moe(hidden_states,
     else:
         assert output.shape == hidden_states.shape, \
             "output shape must be the same as hidden_states shape"
-    if _should_use_ref_fused_moe(is_mxfp8):
+    if _should_use_ref_fused_moe(is_mxfp8, is_block_fp8):
         recipe = _get_recipe(is_fp8, is_mxfp8, is_mxfp4, is_int4,
                              is_block_fp8)
         out = ref_fused_moe(recipe=recipe,
