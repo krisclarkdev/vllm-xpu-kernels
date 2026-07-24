@@ -17,6 +17,32 @@ except ImportError as e:
 
 DEFAULT_FA_VERSION = 2
 
+_logger = logging.getLogger(__name__)
+
+
+def _env_fail_on_fallback() -> bool:
+    """True when VLLM_XPU_ATTN_FAIL_ON_FALLBACK requests fail-closed mode."""
+    return os.environ.get("VLLM_XPU_ATTN_FAIL_ON_FALLBACK",
+                          "0").strip().upper() in ("1", "ON", "TRUE", "YES",
+                                                   "Y")
+
+
+def _is_xpu_capturing() -> bool:
+    """True when the current XPU stream is inside an XPUGraph capture."""
+    is_capturing = getattr(torch.xpu, "is_current_stream_capturing", None)
+    if is_capturing is None:
+        return False
+    try:
+        return bool(is_capturing())
+    except Exception:
+        return False
+
+
+def _should_fail_closed() -> bool:
+    """Fail closed on missing kernels when env says so or while capturing."""
+    return _env_fail_on_fallback() or _is_xpu_capturing()
+
+
 # Speculative-decoding fast path.
 #
 # In speculative decoding every sequence in the batch issues the same small
@@ -591,17 +617,22 @@ def flash_attn_varlen_func(
         except RuntimeError as e:
             if "not compiled" not in str(e):
                 raise
-            # Fallback to PyTorch reference implementation.
-            import logging
-            logger = logging.getLogger(__name__)
-            logger.warning(
+            # Fallback to PyTorch reference unless fail-closed (env or
+            # XPUGraph capture — CPU attn breaks capture/replay).
+            msg = (
                 "XPU kernel not compiled for this config, falling back "
                 "to PyTorch reference attention. Performance will be "
                 "significantly degraded.\n"
                 "To fix: rebuild with the config line shown above.\n"
                 "If this is unexpected, report at: "
                 "https://github.com/vllm-project/vllm-xpu-kernels/issues/364\n"
-                "Original error: %s", e)
+                "Original error: %s")
+            if _should_fail_closed():
+                raise RuntimeError(
+                    "VLLM_XPU_ATTN_FAIL_ON_FALLBACK=1 (or XPUGraph capture): "
+                    "refusing PyTorch attention fallback. " +
+                    (msg % e)) from e
+            _logger.warning(msg, e)
             out, softmax_lse = _fallback_varlen_attn(
                 q, k, v, cu_seqlens_q, cu_seqlens_k, seqused_k,
                 block_table, softmax_scale, causal,
