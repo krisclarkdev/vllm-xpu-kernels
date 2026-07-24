@@ -16,7 +16,7 @@ namespace FLASH_NAMESPACE {
 // - When VLLM_XPU_ATTN_CAPTURE_STRICT=1, require a caller-provided `out`
 //   so the primary output is not allocated inside the op during capture.
 inline bool attn_capture_strict() {
-  auto env_val = getEnv("VLLM_XPU_ATTN_CAPTURE_STRICT");
+  auto env_val = ::getEnv("VLLM_XPU_ATTN_CAPTURE_STRICT");
   if (!env_val.has_value()) {
     return false;
   }
