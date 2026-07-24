@@ -6,6 +6,7 @@
 #include "utils.h"
 #include <torch/all.h>
 #include <cctype>
+#include <cstdlib>
 #include <string>
 
 namespace FLASH_NAMESPACE {
@@ -16,11 +17,11 @@ namespace FLASH_NAMESPACE {
 // - When VLLM_XPU_ATTN_CAPTURE_STRICT=1, require a caller-provided `out`
 //   so the primary output is not allocated inside the op during capture.
 inline bool attn_capture_strict() {
-  auto env_val = ::getEnv("VLLM_XPU_ATTN_CAPTURE_STRICT");
-  if (!env_val.has_value()) {
+  const char* raw = std::getenv("VLLM_XPU_ATTN_CAPTURE_STRICT");
+  if (raw == nullptr || raw[0] == '\0') {
     return false;
   }
-  std::string v = env_val.value();
+  std::string v(raw);
   for (char& c : v) {
     c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
   }
