@@ -5,8 +5,38 @@
 #include "xpu/attn/paged_kv_utils.h"
 #include "utils.h"
 #include <torch/all.h>
+#include <cctype>
+#include <string>
 
 namespace FLASH_NAMESPACE {
+
+// XPUGraph / piecewise capture invariants (v1):
+// - q/k/v/out shapes and effective num_kv_splits must be fixed across replay
+//   (vLLM pads capture sizes). Prefer an explicit num_splits from Python.
+// - When VLLM_XPU_ATTN_CAPTURE_STRICT=1, require a caller-provided `out`
+//   so the primary output is not allocated inside the op during capture.
+inline bool attn_capture_strict() {
+  auto env_val = getEnv("VLLM_XPU_ATTN_CAPTURE_STRICT");
+  if (!env_val.has_value()) {
+    return false;
+  }
+  std::string v = env_val.value();
+  for (char& c : v) {
+    c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+  }
+  return v == "1" || v == "TRUE" || v == "ON" || v == "YES" || v == "Y";
+}
+
+inline void maybe_require_capture_out(
+    const std::optional<at::Tensor>& out_) {
+  if (attn_capture_strict()) {
+    TORCH_CHECK(
+        out_.has_value(),
+        "VLLM_XPU_ATTN_CAPTURE_STRICT=1: flash_attn varlen_fwd requires a "
+        "preallocated `out` tensor under XPUGraph capture (do not allocate "
+        "the primary output inside the op).");
+  }
+}
 
 inline int get_num_splits(
     const sycl::queue& queue,
@@ -180,6 +210,9 @@ std::vector<at::Tensor> mha_varlen_fwd(
       "cu_seqlens_k must have dtype torch.int32");
 
   auto& queue = vllm::xpu::vllmGetQueue(q.device().index());
+
+  // Capture-strict: refuse allocating the primary `out` during graph capture.
+  maybe_require_capture_out(out_);
 
   at::Tensor out;
   if (out_.has_value()) {
@@ -370,6 +403,10 @@ std::vector<at::Tensor> mha_varlen_fwd(
           q.options().device(q.device()));
     }
 
+    // Prefer an explicit num_splits from Python under capture so workspace
+    // shapes (tmp_out / max_logits / exp_sums) stay deterministic across
+    // replay. When nullopt, get_num_splits() is still a pure function of
+    // the tensor dims / max_seqlen_k (stable if capture sizes are padded).
     int num_kv_splits = num_splits.value_or(get_num_splits(
         queue,
         batch_size,

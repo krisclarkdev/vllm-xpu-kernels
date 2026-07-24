@@ -44,6 +44,23 @@ def _should_fail_closed() -> bool:
     return _env_fail_on_fallback() or _is_xpu_capturing()
 
 
+def _host_kv_lens_for_plan(host_kv_lens):
+    """Return host-side KV lengths for split planning without device sync.
+
+    Under XPUGraph capture, a device ``host_kv_lens`` tensor must not be
+    copied to CPU (that would sync). Pass a CPU tensor or a Python sequence.
+    """
+    if not isinstance(host_kv_lens, torch.Tensor):
+        return host_kv_lens
+    if host_kv_lens.device.type == "cpu":
+        return host_kv_lens
+    if _is_xpu_capturing():
+        raise RuntimeError(
+            "XPUGraph capture: host_kv_lens must be a CPU tensor or list "
+            "when num_splits_kv > 1 (device→host sync is not capture-safe). "
+            "Build the split plan outside capture or pass CPU host_kv_lens.")
+    return host_kv_lens
+
 # Speculative-decoding fast path.
 #
 # In speculative decoding every sequence in the batch issues the same small
@@ -532,12 +549,14 @@ def flash_attn_varlen_func(
         # paged query batches (q_len = num_speculative_tokens + 1) from the
         # slow chunk-prefill kernel to the split-K decode kernel. See the
         # comment on _SPEC_DECODE_MAX_QLEN above for the rationale.
+        # Skip under XPUGraph capture: the fast path allocates arange/zeros/
+        # repeat_interleave every call, which is not capture-safe.
         batch = cu_seqlens_q.numel() - 1
         is_uniform_qlen = (batch > 0 and q.shape[0] == batch * max_seqlen_q)
-        if (block_table is not None and causal and not return_softmax_lse
-                and softcap == 0.0 and alibi_slopes is None and q_v is None
-                and q_descale is None and scheduler_metadata is None
-                and seqused_k is not None
+        if (not _is_xpu_capturing() and block_table is not None and causal
+                and not return_softmax_lse and softcap == 0.0
+                and alibi_slopes is None and q_v is None and q_descale is None
+                and scheduler_metadata is None and seqused_k is not None
                 and 1 < max_seqlen_q <= _SPEC_DECODE_MAX_QLEN
                 and is_uniform_qlen):
             return _spec_decode_varlen_fwd(
@@ -560,17 +579,20 @@ def flash_attn_varlen_func(
         # Compute per-seq splits and work_list on host, upload to device.
         # Only enable for decode (max_seqlen_q == 1) with paged KV cache,
         # multi-seq batches, and global num_splits_kv > 1.
+        # Under capture, host_kv_lens must already be CPU-side (no .cpu sync).
+        # If num_splits_kv is None, leave split count to C++ get_num_splits.
         splits_per_seq_dev = None
         work_list_dev = None
         if (block_table is not None and host_kv_lens is not None
                 and num_splits_kv is not None and num_splits_kv > 1
                 and max_seqlen_q == 1):
+            plan_kv_lens = _host_kv_lens_for_plan(host_kv_lens)
             block_size = k.size(1)
             kv_tile = _kv_tile_from_block_size(block_size)
             num_xe_cores = _infer_num_xe_cores(q.device)
             num_heads_kv = k.size(2)
             splits_cpu, work_list_cpu = build_decode_split_plan(
-                host_kv_lens,
+                plan_kv_lens,
                 kv_tile=kv_tile,
                 num_kv_splits=num_splits_kv,
                 num_xe_cores=num_xe_cores,

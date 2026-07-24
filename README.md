@@ -111,6 +111,16 @@ python -m build --wheel --no-isolation
 
 After [vLLM RFC#33214](https://github.com/vllm-project/vllm/issues/33214) was completed, vLLM-XPU migrated to a `vllm-xpu-kernels`-based implementation. Installing the latest vLLM for XPU will pull in `vllm-xpu-kernels` automatically as a wheel dependency — no manual integration is required.
 
+### XPUGraph / piecewise capture (FA2)
+
+vLLM piecewise XPU graphs (`torch.xpu.XPUGraph`, vLLM XPU CUDAGraph support) capture and replay the decode step. This package does **not** implement the graph runner; FA2 must be capture-safe:
+
+- Set `VLLM_XPU_ATTN_FAIL_ON_FALLBACK=1` for serve/E2E so a missing AOT config raises instead of silently using slow PyTorch reference attention (also auto-enabled while an XPU stream is capturing).
+- Prefill/decode shapes used under capture must be in your paged-decode / chunk-prefill kernel configs (see [KERNEL_CONFIGURATION.md](KERNEL_CONFIGURATION.md)).
+- When `num_splits_kv > 1` and host split planning is used, pass **CPU** `host_kv_lens` (or a Python list); device→host sync during capture is rejected.
+- Spec-decode fast path is skipped while capturing (allocates every call); normal varlen is used instead.
+- Optional: `VLLM_XPU_ATTN_CAPTURE_STRICT=1` requires a preallocated `out` tensor so the primary output is not allocated inside the FA2 op during capture.
+
 ### Kernel Configuration
 
 By default, vLLM-XPU compiles kernels for common models (Llama, Qwen, DeepSeek). For customization:
