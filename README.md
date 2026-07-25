@@ -12,9 +12,14 @@ A [vLLM](https://github.com/vllm-project/vllm) component that provides optimized
   - [Installation](#installation)
   - [Build Options](#build-options)
   - [Using with vLLM](#using-with-vllm)
+  - [Kernel Configuration](#kernel-configuration)
+- [Runtime Behavior](#runtime-behavior)
+  - [Attention fail-closed default](#attention-fail-closed-default)
+  - [Mix-batch decode Split-K](#mix-batch-decode-split-k)
+  - [Native MXFP8 / block-FP8 MoE](#native-mxfp8--block-fp8-moe)
+  - [XPUGraph / piecewise capture (FA2)](#xpugraph--piecewise-capture-fa2)
 - [Testing](#testing)
 - [Benchmarks](#benchmarks)
-- [Design Notes](#design-notes)
 - [License](#license)
 
 ---
@@ -31,12 +36,12 @@ Kernels are written in SYCL/DPC++ and leverage [oneDNN](https://github.com/oneap
 |---|---|
 | **Normalization** | RMS norm, fused add-RMS norm, layer norm |
 | **Activation** | SiLU-and-mul, mul-and-SiLU, GeLU (fast/new/quick/tanh), SwigluOAI |
-| **Attention** | Flash attention (variable-length), GDN attention, XE2 attention variants |
+| **Attention** | Flash attention (variable-length) with mix-batch Split-K decode, GDN attention, XE2 attention variants |
 | **Positional Encoding** | Rotary embedding (NeoX and GPT-J styles), DeepSeek scaling RoPE |
-| **Mixture of Experts** | TopK scoring (softmax/sigmoid), grouped TopK, fused grouped TopK; MoE align sum, MoE gather, expert remapping |
+| **Mixture of Experts** | TopK scoring (softmax/sigmoid), grouped TopK, fused grouped TopK; MoE align sum, MoE gather, expert remapping; native Xe2 MXFP8 / block-FP8 fused MoE |
 | **LoRA** | LoRA operator support |
-| **Quantization** | FP8, MxFP4 quantization and GEMM |
-| **GEMM** | Grouped GEMM |
+| **Quantization** | FP8, MxFP4, MXFP8 (E8M0) quantization and GEMM |
+| **GEMM** | Grouped GEMM (including Xe2 MXFP8 B-scales) |
 | **Misc** | TopK per row, memory utilities |
 
 ## Requirements
@@ -113,13 +118,60 @@ After [vLLM RFC#33214](https://github.com/vllm-project/vllm/issues/33214) was co
 
 ### Kernel Configuration
 
-By default, vLLM-XPU compiles kernels for common models (Llama, Qwen, DeepSeek). For customization:
+By default, vLLM-XPU compiles kernels for common models (Llama, Qwen, DeepSeek). The `paged_decode_default.conf` preset includes **pagesize=128** entries for common head sizes (~28 kernels). For full coverage:
 
 ```bash
 VLLM_CHUNK_PREFILL_CONFIG=chunk_prefill_full.conf VLLM_PAGED_DECODE_CONFIG=paged_decode_full.conf pip install .
 ```
 
-See [KERNEL_CONFIGURATION.md](KERNEL_CONFIGURATION.md) for detailed guidance on kernel configuration, presets, and troubleshooting missing kernels.
+See [KERNEL_CONFIGURATION.md](KERNEL_CONFIGURATION.md) for presets, config syntax, fail-closed troubleshooting, and missing-shape rebuild steps.
+
+## Runtime Behavior
+
+Behavior notes for changes landed on this fork’s `main` (Split-K, fail-closed attention, native MXFP8/block-FP8 MoE).
+
+### Attention fail-closed default
+
+Missing FA2 / paged-decode AOT shapes **raise by default** instead of silently falling back to a slow PyTorch reference path (which can destroy tok/s and break XPUGraph capture).
+
+| Mode | Behavior |
+|------|----------|
+| Default (serve) | Raise with a rebuild / config hint |
+| Eager debug | `export VLLM_XPU_ATTN_ALLOW_FALLBACK=1` restores the PyTorch ref path |
+| XPUGraph capture | Always refuse fallback (even with `ALLOW_FALLBACK=1`) |
+
+Details: [KERNEL_CONFIGURATION.md](KERNEL_CONFIGURATION.md).
+
+### Mix-batch decode Split-K
+
+Paged decode with mixed KV lengths can use the Split-K decode path for long rows in a mix-batch (instead of forcing `splits=1` for the whole batch). This is automatic in FA2 when the host split plan selects `num_splits_kv > 1`.
+
+### Native MXFP8 / block-FP8 MoE
+
+On Xe2, fused MoE defaults to the **native** grouped-GEMM path for:
+
+- **MXFP8** — FP8 weights + E8M0 block scales (group=32); W8A16 activations today
+- **Block-FP8** — one-time weight dequant at init → W16A16 native GEMM
+
+| Escape hatch | Effect |
+|--------------|--------|
+| `VLLM_XPU_FUSED_MOE_NATIVE_MXFP8=0` | Disable native MXFP8; use Python ref expert loop |
+| `VLLM_XPU_FUSED_MOE_NATIVE_BLOCK_FP8=0` | Disable native block-FP8 path |
+| `VLLM_XPU_FUSED_MOE_USE_REF=1` | Force the Python `ref_fused_moe` path (A/B / debug) |
+
+Serve note: loading HF MXFP8 MoE also needs vLLM to select the XPU MXFP8 MoE backend and transpose block scales with weights after the XPU weight transpose.
+
+### XPUGraph / piecewise capture (FA2)
+
+vLLM piecewise XPU graphs (`torch.xpu.XPUGraph`) capture and replay the decode step. This package does **not** implement the graph runner; FA2 must stay capture-safe:
+
+- Missing AOT shapes fail closed (see above); fallback is never used while capturing.
+- Prefill/decode shapes used under capture must be in your kernel configs.
+- When host split planning is used, pass **CPU** `host_kv_lens` (or a Python list); device→host sync during capture is rejected.
+- Spec-decode FA2 fast path is skipped while capturing (it allocates every call); normal varlen is used instead.
+- Capture requires a preallocated `out` tensor for the primary FA2 output.
+
+XPUGraph capture→replay smoke may still `xfail` on stacks where FA2 uses `work_group_scratch_memory` (unsupported by SYCL Graph today).
 
 ## Testing
 
@@ -130,6 +182,12 @@ pytest tests/
 ```
 
 Individual test modules cover activations, cache operations, attention, MoE, LoRA, quantization, and memory utilities. See the [`tests/`](tests/) directory for the complete list.
+
+Capture / fail-closed helpers:
+
+```bash
+.venv/bin/python -m pytest tests/flash_attn/test_xpu_graph_capture_safe.py -v
+```
 
 ## Benchmarks
 
