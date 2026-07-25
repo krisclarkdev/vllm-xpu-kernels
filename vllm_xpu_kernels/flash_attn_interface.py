@@ -20,10 +20,15 @@ DEFAULT_FA_VERSION = 2
 
 _logger = logging.getLogger(__name__)
 
+# Opt-in escape hatch for the slow PyTorch reference path when an XPU
+# kernel shape is not compiled. Production / serve defaults to fail-closed
+# (raise) so a missing AOT config cannot silently destroy tok/s.
+_ALLOW_FALLBACK_ENV = "VLLM_XPU_ATTN_ALLOW_FALLBACK"
 
-def _env_fail_on_fallback() -> bool:
-    """True when VLLM_XPU_ATTN_FAIL_ON_FALLBACK requests fail-closed mode."""
-    return os.environ.get("VLLM_XPU_ATTN_FAIL_ON_FALLBACK",
+
+def _env_allow_fallback() -> bool:
+    """True when VLLM_XPU_ATTN_ALLOW_FALLBACK opts into PyTorch ref attn."""
+    return os.environ.get(_ALLOW_FALLBACK_ENV,
                           "0").strip().upper() in ("1", "ON", "TRUE", "YES",
                                                    "Y")
 
@@ -40,8 +45,14 @@ def _is_xpu_capturing() -> bool:
 
 
 def _should_fail_closed() -> bool:
-    """Fail closed on missing kernels when env says so or while capturing."""
-    return _env_fail_on_fallback() or _is_xpu_capturing()
+    """Refuse PyTorch fallback unless explicitly allowed and not capturing.
+
+    Under XPUGraph capture, always fail closed — host reference attention
+    breaks capture/replay even if ALLOW_FALLBACK is set.
+    """
+    if _is_xpu_capturing():
+        return True
+    return not _env_allow_fallback()
 
 
 # Speculative-decoding fast path.
@@ -230,7 +241,9 @@ def build_decode_split_plan(
 
     Inputs
     ------
-    kv_lens         : per-seq KV length in tokens (list/tensor, on host).
+    kv_lens         : per-seq KV length in tokens (list or **CPU** tensor).
+                      Device tensors are rejected — D2H sync is unsafe under
+                      XPUGraph capture and is never performed here.
     kv_tile         : KV tile width in tokens (must equal the kernel's
                       get<1>(TileShapeQK{})).
     num_kv_splits   : global cap on per-seq split count (buffer dim).
@@ -254,7 +267,14 @@ def build_decode_split_plan(
       assignment, hard cap}; the kernel never needs to second-guess it.
     """
     if isinstance(kv_lens, torch.Tensor):
-        kv_lens_list = kv_lens.to(dtype=torch.int32, device="cpu").tolist()
+        if kv_lens.device.type != "cpu":
+            raise RuntimeError(
+                "build_decode_split_plan requires host-side kv_lens "
+                f"(CPU tensor or list); got tensor on {kv_lens.device}. "
+                "Pass host_kv_lens on CPU (or a Python list). Device→host "
+                "sync is not performed and is forbidden under XPUGraph "
+                "capture.")
+        kv_lens_list = kv_lens.to(dtype=torch.int32).tolist()
     else:
         kv_lens_list = [int(v) for v in kv_lens]
 
@@ -467,9 +487,10 @@ def flash_attn_varlen_func(
         cu_seqlens_k: Cumulative sequence lengths for keys/values when not
             using paged KV cache.
         seqused_k: Number of tokens used per sequence when using paged KV.
-        host_kv_lens: Optional host-side per-seq KV lengths. If provided,
-            this function converts them to an int32 device tensor and uses
-            it as seqused_k.
+        host_kv_lens: Optional **host-side** (CPU tensor or list) per-seq KV
+            lengths. If provided, this function uploads them as seqused_k and
+            may build a decode split plan. Device tensors are rejected by the
+            split planner (no D2H under XPUGraph capture).
         block_table: Optional block table for paged KV cache.
         num_splits: Backend-specific split parameter (non-KV specific),
             typically used to control work partitioning in some FA versions.
@@ -493,6 +514,13 @@ def flash_attn_varlen_func(
         "when enable block_table, seqused_k is needed"
     assert block_table is not None or cu_seqlens_k is not None, \
         "when block_table is disabled, cu_seqlens_k is needed"
+
+    capturing = _is_xpu_capturing()
+    if capturing and out is None:
+        raise RuntimeError(
+            "flash_attn_varlen_func: under XPUGraph capture, pass a "
+            "preallocated `out` tensor so the primary output is not "
+            "allocated inside the captured region.")
 
     if softmax_scale is None:
         softmax_scale = q.shape[-1]**(-0.5)
@@ -532,9 +560,12 @@ def flash_attn_varlen_func(
         # paged query batches (q_len = num_speculative_tokens + 1) from the
         # slow chunk-prefill kernel to the split-K decode kernel. See the
         # comment on _SPEC_DECODE_MAX_QLEN above for the rationale.
+        # Skip under XPUGraph capture: the path allocates fresh metadata
+        # (arange / zeros / repeat_interleave) every call.
         batch = cu_seqlens_q.numel() - 1
         is_uniform_qlen = (batch > 0 and q.shape[0] == batch * max_seqlen_q)
-        if (block_table is not None and causal and not return_softmax_lse
+        if (not capturing and block_table is not None and causal
+                and not return_softmax_lse
                 and softcap == 0.0 and alibi_slopes is None and q_v is None
                 and q_descale is None and scheduler_metadata is None
                 and seqused_k is not None
@@ -560,6 +591,8 @@ def flash_attn_varlen_func(
         # Compute per-seq splits and work_list on host, upload to device.
         # Only enable for decode (max_seqlen_q == 1) with paged KV cache,
         # multi-seq batches, and global num_splits_kv > 1.
+        # host_kv_lens must already be CPU/list (build_decode_split_plan
+        # refuses device tensors — required for XPUGraph capture safety).
         splits_per_seq_dev = None
         work_list_dev = None
         if (block_table is not None and host_kv_lens is not None
@@ -618,8 +651,9 @@ def flash_attn_varlen_func(
         except RuntimeError as e:
             if "not compiled" not in str(e):
                 raise
-            # Fallback to PyTorch reference unless fail-closed (env or
-            # XPUGraph capture — CPU attn breaks capture/replay).
+            # Missing AOT shape: fail closed by default. Opt into the slow
+            # PyTorch path with VLLM_XPU_ATTN_ALLOW_FALLBACK=1 (eager only;
+            # XPUGraph capture always refuses).
             msg = (
                 "XPU kernel not compiled for this config, falling back "
                 "to PyTorch reference attention. Performance will be "
@@ -630,9 +664,10 @@ def flash_attn_varlen_func(
                 "Original error: %s")
             if _should_fail_closed():
                 raise RuntimeError(
-                    "VLLM_XPU_ATTN_FAIL_ON_FALLBACK=1 (or XPUGraph capture): "
-                    "refusing PyTorch attention fallback. " +
-                    (msg % e)) from e
+                    "Fail-closed attention (default): refusing PyTorch "
+                    "attention fallback. Set VLLM_XPU_ATTN_ALLOW_FALLBACK=1 "
+                    "to opt in for eager debug only (ignored under "
+                    "XPUGraph capture). " + (msg % e)) from e
             _logger.warning(msg, e)
             out, softmax_lse = _fallback_varlen_attn(
                 q, k, v, cu_seqlens_q, cu_seqlens_k, seqused_k,
