@@ -12,7 +12,13 @@
 #define HEAD_SIZE_LIMIT_6 512
 #define HEAD_SIZE_LIMIT_7 576
 
-enum class CutlassDType { half, bfloat16, float8_e4m3, float8_e5m2 };
+enum class CutlassDType {
+  half,
+  bfloat16,
+  float8_e4m3,
+  float8_e5m2,
+  uint8  // packed int4-KV storage (M1+); not a Cute MMA ElementK yet
+};
 
 // Struct to carry separate Q and K dtypes without breaking existing API
 struct CutlassQKType {
@@ -40,11 +46,13 @@ inline CutlassDType aten_to_dtype(const at::ScalarType st) {
     return CutlassDType::float8_e4m3;
   } else if (st == torch::kFloat8_e5m2) {
     return CutlassDType::float8_e5m2;
+  } else if (st == torch::kByte) {
+    return CutlassDType::uint8;
   }
   TORCH_INTERNAL_ASSERT(
       false,
-      "Unsupported dtype: only half/bfloat16/float8_e4m3/float8_e5m2 supported "
-      "for Q/K.");
+      "Unsupported dtype: only half/bfloat16/float8_e4m3/float8_e5m2/uint8 "
+      "supported for Q/K.");
 }
 
 inline CutlassDType aten_to_dtype(const at::Tensor& t) {

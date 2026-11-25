@@ -483,28 +483,49 @@ if(BUILD_SYCL_TLA_KERNELS)
 
 endif()
 
-# Probe outside the TLA block: the quant asm dispatch in _C (is_xe3p_arch) needs
-# this define even when the SYCL-TLA kernels are disabled.
-if(VLLM_XPU_ENABLE_XE3P)
-  # The intel_gpu_cri SYCL architecture enumerator only exists on CRI-enabled
-  # oneAPI toolchains. Detect it so is_xe3p_arch() (csrc/utils.h) can reference
-  # it when available and fall back to intel_gpu_nvl_p otherwise.
-  get_filename_component(_icpx_bindir "${CMAKE_CXX_COMPILER}" DIRECTORY)
-  set(_sycl_arch_def
-      "${_icpx_bindir}/../include/sycl/ext/oneapi/experimental/device_architecture.def"
-  )
-  if(EXISTS "${_sycl_arch_def}")
-    file(STRINGS "${_sycl_arch_def}" _cri_arch_lines REGEX "intel_gpu_cri[^_]")
+# Probe SYCL arch enumerators used by csrc/utils.h (is_cri / is_nvl_p /
+# is_xe3p_arch). These land at different oneAPI releases — 2025.3 lacks
+# intel_gpu_nvl_p (trellis image); ~2026 adds it. Always probe (not only when
+# XE3P kernels are enabled) so xe_2 TUs that include utils.h still compile.
+get_filename_component(_icpx_bindir "${CMAKE_CXX_COMPILER}" DIRECTORY)
+set(_sycl_arch_def
+    "${_icpx_bindir}/../include/sycl/ext/oneapi/experimental/device_architecture.def"
+)
+if(EXISTS "${_sycl_arch_def}")
+  file(STRINGS "${_sycl_arch_def}" _cri_arch_lines REGEX "intel_gpu_cri[^_]")
+  if(_cri_arch_lines)
+    message(STATUS "Toolchain supports intel_gpu_cri architecture")
+    list(APPEND VLLM_GPU_COMPILE_FLAGS -DVLLM_XPU_HAS_INTEL_GPU_CRI)
+  else()
+    message(STATUS "Toolchain lacks intel_gpu_cri architecture enumerator")
+  endif()
+  file(STRINGS "${_sycl_arch_def}" _nvl_arch_lines REGEX "intel_gpu_nvl_p[^_a-zA-Z0-9]")
+  if(NOT _nvl_arch_lines)
+    # Some .def files use a bare token without trailing non-id; retry looser.
+    file(STRINGS "${_sycl_arch_def}" _nvl_arch_lines REGEX "intel_gpu_nvl_p")
+  endif()
+  if(_nvl_arch_lines)
+    message(STATUS "Toolchain supports intel_gpu_nvl_p architecture")
+    list(APPEND VLLM_GPU_COMPILE_FLAGS -DVLLM_XPU_HAS_INTEL_GPU_NVL_P)
+  else()
+    message(
+      STATUS
+        "Toolchain lacks intel_gpu_nvl_p; is_nvl_p()/is_xe3p_arch() nvl branch disabled"
+    )
+  endif()
+  # xe_2/xe_3 TLA libs use SYCL_TLA_KERNELS_COMPILE_FLAGS, not
+  # VLLM_GPU_COMPILE_FLAGS — mirror arch probes there too.
+  if(DEFINED SYCL_TLA_KERNELS_COMPILE_FLAGS)
     if(_cri_arch_lines)
-      message(STATUS "Toolchain supports intel_gpu_cri architecture")
-      list(APPEND VLLM_GPU_COMPILE_FLAGS -DVLLM_XPU_HAS_INTEL_GPU_CRI)
-    else()
-      message(
-        STATUS
-          "Toolchain lacks intel_gpu_cri; is_xe3p_arch() will use intel_gpu_nvl_p only"
-      )
+      list(APPEND SYCL_TLA_KERNELS_COMPILE_FLAGS -DVLLM_XPU_HAS_INTEL_GPU_CRI)
+    endif()
+    if(_nvl_arch_lines)
+      list(APPEND SYCL_TLA_KERNELS_COMPILE_FLAGS -DVLLM_XPU_HAS_INTEL_GPU_NVL_P)
     endif()
   endif()
+else()
+  message(
+    STATUS "SYCL device_architecture.def not found at ${_sycl_arch_def}")
 endif()
 
 # Feature compile defines — these guard op registrations and interface code so

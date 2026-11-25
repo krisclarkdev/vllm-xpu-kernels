@@ -101,23 +101,37 @@ static inline bool is_cri(at::DeviceIndex device_index = -1) {
 #endif
 }
 
+// intel_gpu_nvl_p landed in oneAPI ~2026; trellis/omix 2025.3 lacks it.
+// CMake sets VLLM_XPU_HAS_INTEL_GPU_NVL_P when the toolchain enumerates it.
 static inline bool is_nvl_p(at::DeviceIndex device_index = -1) {
+#ifdef VLLM_XPU_HAS_INTEL_GPU_NVL_P
   return get_device_architecture(device_index) ==
          syclex::architecture::intel_gpu_nvl_p;
+#else
+  (void)device_index;
+  return false;
+#endif
 }
 
 // Xe3p (CRI / Nova Lake P) architecture check used to dispatch the XE3
-// attention kernels. The intel_gpu_cri architecture enumerator only exists on
-// CRI-enabled oneAPI toolchains, so it is referenced only when the build system
-// detects it (VLLM_XPU_HAS_INTEL_GPU_CRI). intel_gpu_nvl_p is available on the
-// baseline toolchain, so the check still compiles without CRI support.
+// attention kernels. Both intel_gpu_cri and intel_gpu_nvl_p are optional
+// enumerators — CMake probes the SYCL arch .def and sets
+// VLLM_XPU_HAS_INTEL_GPU_{CRI,NVL_P} when present.
 static inline bool is_xe3p_arch(at::DeviceIndex device_index = -1) {
+#if defined(VLLM_XPU_HAS_INTEL_GPU_CRI) || defined(VLLM_XPU_HAS_INTEL_GPU_NVL_P)
   auto arch = get_device_architecture(device_index);
   return
 #ifdef VLLM_XPU_HAS_INTEL_GPU_CRI
       arch == syclex::architecture::intel_gpu_cri ||
 #endif
-      arch == syclex::architecture::intel_gpu_nvl_p;
+#ifdef VLLM_XPU_HAS_INTEL_GPU_NVL_P
+      arch == syclex::architecture::intel_gpu_nvl_p ||
+#endif
+      false;
+#else
+  (void)device_index;
+  return false;
+#endif
 }
 
 // is_xe3p_arch cached per device, for host dispatch on every op call: the

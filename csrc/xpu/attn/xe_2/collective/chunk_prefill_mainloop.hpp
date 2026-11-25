@@ -35,6 +35,8 @@
 #include "cutlass/cutlass.h"
 #include "cutlass/gemm/dispatch_policy.hpp"
 
+#include <cstdint>
+
 #include "cute/algorithm/functional.hpp"
 #include "cute/algorithm/gemm.hpp"
 #include "cute/algorithm/subgroup_algorithms.hpp"
@@ -875,6 +877,11 @@ struct DecodeFwdMainloop<
   static constexpr bool CausalMask = CausalMask_;
   static constexpr bool Fp8KV =
       is_any_of_v<ElementK, float_e5m2_t, float_e4m3_t>;
+  // Int4KV: ElementK=uint8_t with packed_hs=head/2. M1 routes int4 through
+  // the standalone SYCL paged_decode_int4 path (see paged_decode_int4.hpp)
+  // because Cute TileShape D expects logical head_size while storage is
+  // half-width — post-copy dequant into ElementQ fragments lands here next.
+  static constexpr bool Int4KV = is_same_v<ElementK, uint8_t>;
   static constexpr bool LocalMask = LocalMask_;
 
   // User-facing arguments
@@ -892,6 +899,10 @@ struct DecodeFwdMainloop<
     int window_size_right;
     // Physical stride between paged blocks in seq-position units
     int page_stride_elements;
+    // Int4 per-token-head scale strides (elements); unused unless Int4KV.
+    int scale_stride_page = 0;
+    int scale_stride_seq = 0;
+    int scale_stride_heads = 0;
   };
 
   // Kernel-facing parameters
@@ -922,10 +933,18 @@ struct DecodeFwdMainloop<
         args.total_seqlen_kv,
         args.window_size_left,
         args.window_size_right,
-        args.page_stride_elements};
+        args.page_stride_elements,
+        args.scale_stride_page,
+        args.scale_stride_seq,
+        args.scale_stride_heads};
   }
 
-  CUTLASS_HOST_DEVICE static bool can_implement(Arguments const&) {
+  CUTLASS_HOST_DEVICE static bool can_implement(Arguments const& args) {
+    // Cute MMA Int4KV not linked yet — M1 uses paged_decode_int4 SYCL path.
+    if constexpr (Int4KV) {
+      return false;
+    }
+    (void)args;
     return true;
   }
 

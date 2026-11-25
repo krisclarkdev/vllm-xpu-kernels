@@ -31,4 +31,31 @@ void cutlass_paged_decode_xe2(
     std::optional<at::Tensor>& splits_per_seq,
     std::optional<at::Tensor>& work_list,
     std::optional<at::Tensor>& softmax_lse);
+
+/// True when K/V are uint8 packed + per-token-head float scales (int4 path).
+bool is_int4_paged_decode_request(
+    const at::Tensor& query,
+    const at::Tensor& key_cache,
+    const at::Tensor& value_cache,
+    const std::optional<const at::Tensor>& k_scale,
+    const std::optional<const at::Tensor>& v_scale);
+
+/// M1 SYCL int4 paged decode (hd=128, block%64==0). In-kernel dequant.
+void cutlass_paged_decode_int4_xe2(
+    sycl::queue& queue,
+    const at::Tensor& query,
+    const at::Tensor& key_cache,
+    const at::Tensor& value_cache,
+    at::Tensor& out,
+    const at::Tensor& block_table,
+    const at::Tensor& cu_seqlens_q,
+    const at::Tensor& cu_seqlens_k,
+    int max_seqlen_q,
+    int max_seqlen_k,
+    const at::Tensor& k_scale,
+    const at::Tensor& v_scale,
+    double sm_scale,
+    int window_size_left,
+    int window_size_right,
+    bool is_local);
 }  // namespace vllm::xpu::xe2

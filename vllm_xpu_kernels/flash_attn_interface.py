@@ -18,11 +18,10 @@ except ImportError as e:
 
 DEFAULT_FA_VERSION = 2
 
-# Greenfield FA2 int4-KV in-kernel path (xe_2 paged_decode). Flip to True
-# only after int4 policies are built into _vllm_fa2_C and decode mainloop
-# loads packed uint8 + per-token-head scales. Until then vLLM keeps Triton
-# for int4_per_token_head (VLLM_XPU_FA_INT4 ignored unless this is True).
-FA_INT4_AVAILABLE = False
+# Greenfield FA2 int4-KV in-kernel path (xe_2 paged_decode). True when the
+# wheel links paged_decode_int4 (hd=128 / block%64). vLLM still requires
+# VLLM_XPU_FA_INT4=1 to route; default remains Triton.
+FA_INT4_AVAILABLE = True
 FA_INT4_HEAD_SIZE = 128
 FA_INT4_BLOCK_SIZE = 64
 
@@ -496,9 +495,28 @@ def flash_attn_varlen_func(
 
     if softmax_scale is None:
         softmax_scale = q.shape[-1]**(-0.5)
-    q_descale = _normalize_descale_tensor(q_descale, "q_descale")
-    k_descale = _normalize_descale_tensor(k_descale, "k_descale")
-    v_descale = _normalize_descale_tensor(v_descale, "v_descale")
+    # Int4-KV: per-token-head scale caches (numel > 1), not fp8 scalar views.
+    # Must skip _normalize_descale_tensor which asserts a single-scalar storage.
+    is_int4_kv = (
+        k.dtype == torch.uint8 and v.dtype == torch.uint8
+        and k_descale is not None and v_descale is not None
+        and k_descale.dtype == torch.float32 and v_descale.dtype == torch.float32
+        and k_descale.numel() > 1 and v_descale.numel() > 1)
+    if is_int4_kv:
+        if not FA_INT4_AVAILABLE:
+            raise RuntimeError(
+                "int4 KV passed to flash_attn_varlen_func but "
+                "FA_INT4_AVAILABLE is False")
+        if q_descale is not None:
+            raise NotImplementedError("int4 KV does not use q_descale")
+        if k.shape[-1] != q.shape[-1] // 2:
+            raise ValueError(
+                f"int4 KV packed last-dim must be head_size/2; "
+                f"got K={tuple(k.shape)} Q={tuple(q.shape)}")
+    else:
+        q_descale = _normalize_descale_tensor(q_descale, "q_descale")
+        k_descale = _normalize_descale_tensor(k_descale, "k_descale")
+        v_descale = _normalize_descale_tensor(v_descale, "v_descale")
     # custom op does not support non-tuple input
     real_window_size: tuple[int, int]
     if window_size is None:

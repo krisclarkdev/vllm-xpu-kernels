@@ -194,12 +194,41 @@ std::vector<at::Tensor> mha_varlen_fwd(
 
   TORCH_CHECK(
       v.scalar_type() == k_type, "key and value must have the same dtype");
+  // Int4-KV: packed uint8 K/V + per-token-head float scales (not fp8
+  // per-tensor broadcast). Detected here so dtype checks accept Byte KV.
+  const bool is_int4_kv =
+      k_type == at::ScalarType::Byte &&
+      k_scale.has_value() && v_scale.has_value() &&
+      k_scale->scalar_type() == at::ScalarType::Float &&
+      v_scale->scalar_type() == at::ScalarType::Float &&
+      k_scale->numel() > 1 && v_scale->numel() > 1;
   if (k_type != at::ScalarType::Float8_e5m2 &&
-      k_type != at::ScalarType::Float8_e4m3fn) {
+      k_type != at::ScalarType::Float8_e4m3fn && !is_int4_kv) {
     TORCH_CHECK(
         k.scalar_type() == q_type, "query and key must have the same dtype");
     TORCH_CHECK(
         v.scalar_type() == q_type, "query and value must have the same dtype");
+  }
+  if (is_int4_kv) {
+    TORCH_CHECK(
+        q_type == at::ScalarType::Half || q_type == at::ScalarType::BFloat16,
+        "int4 KV requires fp16/bf16 query");
+    TORCH_CHECK(
+        k.dim() == 4 && k.size(-1) == q.size(-1) / 2,
+        "int4 KV packed last-dim must be head_size/2 (got K=",
+        k.sizes(),
+        " Q head=",
+        q.size(-1),
+        ")");
+    // block_table_ is the paged-KV optional; is_paged is assigned later.
+    TORCH_CHECK(
+        block_table_.has_value(),
+        "int4 KV M1 requires paged KV (block_table)");
+    // Prefill / mix_batch not in M1 slice — decode-only vertical.
+    TORCH_CHECK(
+        max_seqlen_q == 1,
+        "int4 KV M1 is decode-only (max_seqlen_q==1); got ",
+        max_seqlen_q);
   }
 
   CHECK_DEVICE(q);
@@ -429,7 +458,9 @@ std::vector<at::Tensor> mha_varlen_fwd(
     int num_tokens = q.size(0);
     int batch_size = static_cast<int>(cu_seqlens_q.size(0)) - 1;
     int num_heads_q = q.size(1);
-    int v_head_dim = v.size(-1);
+    // Int4: V storage last-dim is packed_hs; logical output head dim is Q's.
+    int v_head_dim = is_int4_kv ? static_cast<int>(q.size(-1))
+                                : static_cast<int>(v.size(-1));
     int num_heads_kv = k.size(2);
     int block_size = k.size(1);
 
@@ -454,14 +485,18 @@ std::vector<at::Tensor> mha_varlen_fwd(
           q.options().dtype(out_dtype).device(q.device()));
     }
 
-    int num_kv_splits = num_splits.value_or(get_num_splits(
-        queue,
-        batch_size,
-        num_heads_q,
-        num_heads_kv,
-        effective_seqlen_k,
-        block_size,
-        tuned_decode_config(q, k, v)));
+    // M1 int4 SYCL path has no split-K; force 1. Fp16/fp8 keep the tuner.
+    int num_kv_splits =
+        is_int4_kv
+            ? 1
+            : num_splits.value_or(get_num_splits(
+                  queue,
+                  batch_size,
+                  num_heads_q,
+                  num_heads_kv,
+                  effective_seqlen_k,
+                  block_size,
+                  tuned_decode_config(q, k, v)));
 
     // The partial outputs carry the output precision, which differs from Q's
     // for full fp8 attention.

@@ -40,6 +40,52 @@ void cutlass_paged_decode_xe2(
     std::optional<at::Tensor>& splits_per_seq,
     std::optional<at::Tensor>& work_list,
     std::optional<at::Tensor>& softmax_lse) {
+  // M1 int4 policy: uint8 packed KV + per-token-head scales → SYCL dequant
+  // decode (hd=128 / block%64). Cute DecodeFwdMainloop Int4KV is follow-on.
+  if (is_int4_paged_decode_request(
+          query, key_cache, value_cache, k_scale, v_scale)) {
+    TORCH_CHECK(
+        is_paged && is_varlen,
+        "int4 paged_decode requires paged varlen layout");
+    TORCH_CHECK(
+        !is_sink,
+        "int4 paged_decode M1 does not support softmax sink");
+    TORCH_CHECK(
+        num_kv_splits <= 1,
+        "int4 paged_decode M1 does not support split-K (num_kv_splits=",
+        num_kv_splits,
+        ")");
+    TORCH_CHECK(
+        k_scale.has_value() && v_scale.has_value(),
+        "int4 paged_decode requires k_scale and v_scale");
+    (void)temp_out;
+    (void)softmax_lse_accum;
+    (void)is_causal;
+    (void)is_prefill;
+    (void)splits_per_seq;
+    (void)work_list;
+    (void)softmax_lse;
+    (void)sm_sink_;
+    cutlass_paged_decode_int4_xe2(
+        queue,
+        query,
+        key_cache,
+        value_cache,
+        out,
+        block_table,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        *k_scale,
+        *v_scale,
+        sm_scale,
+        window_size_left,
+        window_size_right,
+        is_local);
+    return;
+  }
+
   cutlass_paged_decode_impl(
       queue,
       query,
