@@ -18,6 +18,14 @@ except ImportError as e:
 
 DEFAULT_FA_VERSION = 2
 
+# Greenfield FA2 int4-KV in-kernel path (xe_2 paged_decode). Flip to True
+# only after int4 policies are built into _vllm_fa2_C and decode mainloop
+# loads packed uint8 + per-token-head scales. Until then vLLM keeps Triton
+# for int4_per_token_head (VLLM_XPU_FA_INT4 ignored unless this is True).
+FA_INT4_AVAILABLE = False
+FA_INT4_HEAD_SIZE = 128
+FA_INT4_BLOCK_SIZE = 64
+
 # Tracks configs we have already warned about so the
 # missing-kernel fallback notice is emitted once per config rather
 # than on every decode step.
