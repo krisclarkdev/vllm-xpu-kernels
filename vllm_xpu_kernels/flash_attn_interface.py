@@ -451,6 +451,8 @@ def flash_attn_varlen_func(
     is_mix_batch: bool = True,
     host_kv_lens: Optional[torch.Tensor] = None,
     dynamic_causal: Optional[torch.Tensor] = None,
+    # Prod trellis _xpu_ops still forwards this name; alias to dynamic_causal.
+    per_seq_causal: Optional[torch.Tensor] = None,
 ):
     """
     FlashAttention interface for variable-length sequences, with optional
@@ -477,7 +479,13 @@ def flash_attn_varlen_func(
         dynamic_causal: Optional int32 tensor with one entry per sequence.
             Nonzero entries use causal masking and zero entries use
             bidirectional attention. When provided, it overrides ``causal``.
+        per_seq_causal: Alias for ``dynamic_causal`` (prod _xpu_ops name).
     """
+    if per_seq_causal is not None:
+        if dynamic_causal is not None:
+            raise ValueError(
+                "dynamic_causal and per_seq_causal cannot both be set")
+        dynamic_causal = per_seq_causal
     if host_kv_lens is not None:
         if seqused_k is not None:
             raise ValueError("Provide only one of host_kv_lens and seqused_k")

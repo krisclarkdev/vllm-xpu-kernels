@@ -33,3 +33,7 @@ g++ -std=c++17 -I. -o /tmp/test_int4_dequant tests/attn/test_int4_kv_dequant_hos
 
 `FA_INT4_AVAILABLE = True` in the M1 wheel (`dist/vllm_xpu_kernels-0.1.0+fa2int4m1-*.whl`).
 vLLM still needs `VLLM_XPU_FA_INT4=1`. Oracle A/B on B70 before prod.
+
+## Test image
+
+`192.168.1.228:5000/hal/trellis-serve:fa2-int4-m1c` — m1b + int4 write import fix (`triton_reshape_and_cache_flash_per_token_head_quant`). Image-built FA2 (`libsycl.so.8`); never overlay host `_C`/`_xpu_C`. Notes: `NOTES-fa2-int4-impl.md`.
