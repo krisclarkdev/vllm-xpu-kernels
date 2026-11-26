@@ -40,7 +40,8 @@ bool is_int4_paged_decode_request(
     const std::optional<const at::Tensor>& k_scale,
     const std::optional<const at::Tensor>& v_scale);
 
-/// M1 SYCL int4 paged decode (hd=128, block%64==0). In-kernel dequant.
+/// M1 SYCL int4 paged decode (hd=128, block%64==0). Debug rollback only
+/// (VLLM_XPU_FA_INT4_M1_SYCL=1). Hot path is Cute DecodeFwdMainloop::Int4KV.
 void cutlass_paged_decode_int4_xe2(
     sycl::queue& queue,
     const at::Tensor& query,

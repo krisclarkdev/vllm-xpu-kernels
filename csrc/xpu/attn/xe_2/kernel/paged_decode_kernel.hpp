@@ -480,7 +480,8 @@ class XeFMHAFwdSplitKVKernel {
             thr_id,
             seq_len,
             full_tile_offset,
-            discard_seq_coord);
+            discard_seq_coord,
+            head);
       } else {
         mainloop.template operator()<false>(
             Q(_, _, head, l_coord),
@@ -497,7 +498,8 @@ class XeFMHAFwdSplitKVKernel {
             thr_id,
             seq_len,
             full_tile_offset,
-            discard_seq_coord);
+            discard_seq_coord,
+            head);
       }
 
       if constexpr (

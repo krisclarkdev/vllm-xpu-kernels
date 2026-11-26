@@ -1,5 +1,6 @@
 #include "paged_decode_xe2.h"
 #include "paged_decode_utils.hpp"
+#include "utils.h"
 // Use the generated extern header (only declares enabled policies)
 #if __has_include("paged_decode_extern_gen.hpp")
   #include "paged_decode_extern_gen.hpp"
@@ -9,6 +10,19 @@
 
 namespace vllm::xpu::xe2 {
 using namespace cute;
+
+namespace {
+
+/// Debug rollback: force M1 scalar SYCL int4 decode (VLLM_XPU_FA_INT4_M1_SYCL=1).
+bool force_int4_m1_sycl() {
+  auto env_value = getEnv("VLLM_XPU_FA_INT4_M1_SYCL");
+  if (!env_value.has_value()) return false;
+  auto value = env_value.value();
+  return value == "1" || value == "true" || value == "TRUE" || value == "ON" ||
+         value == "on" || value == "yes" || value == "YES";
+}
+
+}  // namespace
 
 void cutlass_paged_decode_xe2(
     sycl::queue& queue,
@@ -40,10 +54,11 @@ void cutlass_paged_decode_xe2(
     std::optional<at::Tensor>& splits_per_seq,
     std::optional<at::Tensor>& work_list,
     std::optional<at::Tensor>& softmax_lse) {
-  // M1 int4 policy: uint8 packed KV + per-token-head scales → SYCL dequant
-  // decode (hd=128 / block%64). Cute DecodeFwdMainloop Int4KV is follow-on.
+  // Int4 hot path: Cute/DPAS DecodeFwdMainloop::Int4KV (dequant FE).
+  // M1 scalar SYCL kept behind VLLM_XPU_FA_INT4_M1_SYCL=1 for A/B / oracle.
   if (is_int4_paged_decode_request(
-          query, key_cache, value_cache, k_scale, v_scale)) {
+          query, key_cache, value_cache, k_scale, v_scale) &&
+      force_int4_m1_sycl()) {
     TORCH_CHECK(
         is_paged && is_varlen,
         "int4 paged_decode requires paged varlen layout");
@@ -161,6 +176,8 @@ void cutlass_paged_decode_impl(
     std::optional<at::Tensor>& softmax_lse) {
   bool is_fp8_kv = key_cache.scalar_type() == at::ScalarType::Float8_e5m2 ||
                    key_cache.scalar_type() == at::ScalarType::Float8_e4m3fn;
+  bool is_int4_kv = is_int4_paged_decode_request(
+      query, key_cache, value_cache, k_scale, v_scale);
   if (is_fp8_kv) {
     TORCH_CHECK(
         k_scale.has_value() && v_scale.has_value(),
@@ -175,6 +192,21 @@ void cutlass_paged_decode_impl(
             is_single_value_broadcast_tensor(*v_scale),
         "FP8 KV v_scale must be a float32 tensor with a single element.");
   }
+  if (is_int4_kv) {
+    TORCH_CHECK(
+        is_paged && is_varlen,
+        "int4 paged_decode requires paged varlen layout");
+    TORCH_CHECK(
+        !is_sink, "int4 paged_decode does not support softmax sink");
+    TORCH_CHECK(
+        num_kv_splits <= 1,
+        "int4 paged_decode does not support split-K yet (num_kv_splits=",
+        num_kv_splits,
+        ")");
+    TORCH_CHECK(
+        k_scale.has_value() && v_scale.has_value(),
+        "int4 paged_decode requires k_scale and v_scale");
+  }
 
   // general params
   int batch_size, num_heads_q, num_heads_kv, head_size, v_head_size;
@@ -187,7 +219,9 @@ void cutlass_paged_decode_impl(
     num_heads_q = query.size(1);
     num_heads_kv = key_cache.size(1);
     head_size = query.size(2);
-    v_head_size = value_cache.size(-1);
+    // Int4: V storage last-dim is packed_hs; logical VO head is Q's.
+    v_head_size =
+        is_int4_kv ? head_size : static_cast<int>(value_cache.size(-1));
     total_seqlen_q = query.size(0);
     total_seqlen_k = key_cache.size(0);
   } else {
@@ -196,7 +230,8 @@ void cutlass_paged_decode_impl(
     num_heads_q = query.size(1);
     num_heads_kv = key_cache.size(1);
     head_size = query.size(3);
-    v_head_size = value_cache.size(-1);
+    v_head_size =
+        is_int4_kv ? head_size : static_cast<int>(value_cache.size(-1));
     max_seqlen_q = query.size(2);
     max_seqlen_k = key_cache.size(2);
   }
@@ -209,6 +244,27 @@ void cutlass_paged_decode_impl(
     num_heads_kv = key_cache.size(2);
     max_blocks_per_seq = block_table.size(1);
     total_seqlen_k = num_blocks * block_size;
+  }
+
+  if (is_int4_kv) {
+    TORCH_CHECK(
+        head_size == 128,
+        "int4 Cute paged_decode requires head_size=128, got ",
+        head_size);
+    TORCH_CHECK(
+        key_cache.size(-1) == head_size / 2 &&
+            value_cache.size(-1) == head_size / 2,
+        "int4 Cute paged_decode requires packed_hs=head_size/2");
+    TORCH_CHECK(
+        block_size % 64 == 0,
+        "int4 Cute paged_decode requires block_size multiple of 64, got ",
+        block_size);
+    TORCH_CHECK(
+        k_scale->sizes() ==
+                at::IntArrayRef(
+                    {key_cache.size(0), key_cache.size(1), key_cache.size(2)}) &&
+            v_scale->sizes() == k_scale->sizes(),
+        "int4 scales must be [blocks, block_size, Hkv]");
   }
 
   if (is_local) {
@@ -237,8 +293,8 @@ void cutlass_paged_decode_impl(
       max_seqlen_k,
       total_seqlen_q,
       total_seqlen_k,
-      is_fp8_kv ? k_scale.value().data_ptr() : nullptr,
-      is_fp8_kv ? v_scale.value().data_ptr() : nullptr,
+      (is_fp8_kv || is_int4_kv) ? k_scale.value().data_ptr() : nullptr,
+      (is_fp8_kv || is_int4_kv) ? v_scale.value().data_ptr() : nullptr,
       static_cast<float>(sm_scale),
       is_sink ? sm_sink_.value().data_ptr() : nullptr,
       batch_size,
@@ -273,10 +329,21 @@ void cutlass_paged_decode_impl(
       is_varlen ? int64_t{0} : query.stride(0),
       page_stride_elements};
 
+  if (is_int4_kv) {
+    args.scale_stride_page = static_cast<int>(k_scale->stride(0));
+    args.scale_stride_seq = static_cast<int>(k_scale->stride(1));
+    args.scale_stride_heads = static_cast<int>(k_scale->stride(2));
+    TORCH_CHECK(
+        args.scale_stride_page > 0 && args.scale_stride_seq > 0,
+        "int4 scale strides must be positive");
+  }
+
   // For non-contiguous paged KV (e.g., cross-layer KV cache), enlarge
   // total_seqlen_k to cover the full physical extent for the 2D block
   // load surface descriptor. Without this, block loads for blocks at
   // higher physical addresses would return zeros.
+  // Int4KV uses scalar dequant addressing (not 2D block loads on K/V), but
+  // keep the same physical extent so page-table remapping stays consistent.
   if (is_paged) {
     int64_t effective_total =
         get_paged_kv_cache_effective_total_seqlen(key_cache);
@@ -339,6 +406,12 @@ void cutlass_paged_decode_impl(
       head_size <= max_head_size,
       "FMHA forward only supports head dimension at most " +
           std::to_string(max_head_size));
+
+  if (is_int4_kv) {
+    // Narrow Cute Int4KV instantiation (q8/q16 × h128 × p64 only).
+    decode_int4_dispatch(queue, cuQKType, args);
+    return;
+  }
 
   auto get_head_size_case = [](int head_size) -> int {
     if (head_size <= HEAD_SIZE_LIMIT_0) return 0;

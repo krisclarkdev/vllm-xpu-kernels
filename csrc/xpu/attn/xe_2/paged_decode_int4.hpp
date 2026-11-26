@@ -6,9 +6,8 @@
  * Scope: head_size=128, block_size multiple of 64 (policy target block=64),
  * Q in fp16/bf16, GQA, causal decode (q_len typically 1), optional local window.
  *
- * This is a correctness-first SYCL path (not Cute/DPAS FA2). It dequants K/V
- * inside the attention loop via int4_kv_dequant.hpp — no gather→fp16 materialize.
- * Cute DecodeFwdMainloop Int4KV integration is a follow-on once Oracle A passes.
+ * Correctness-first SYCL path (not Cute/DPAS). Hot path is DecodeFwdMainloop
+ * Int4KV; keep this launcher behind VLLM_XPU_FA_INT4_M1_SYCL=1 for A/B.
  **************************************************************************************************/
 
 #pragma once

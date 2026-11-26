@@ -44,6 +44,7 @@
 #include "flash_attention_v2/collective/fmha_fusion.hpp"
 
 #include "block_2d_align.hpp"
+#include "csrc/xpu/attn/int4_kv_dequant.hpp"
 
 namespace cutlass::fmha {
 // Arch-tagged inline namespace: gives these definitions a mangled name
@@ -877,10 +878,9 @@ struct DecodeFwdMainloop<
   static constexpr bool CausalMask = CausalMask_;
   static constexpr bool Fp8KV =
       is_any_of_v<ElementK, float_e5m2_t, float_e4m3_t>;
-  // Int4KV: ElementK=uint8_t with packed_hs=head/2. M1 routes int4 through
-  // the standalone SYCL paged_decode_int4 path (see paged_decode_int4.hpp)
-  // because Cute TileShape D expects logical head_size while storage is
-  // half-width — post-copy dequant into ElementQ fragments lands here next.
+  // Int4KV: ElementK=uint8_t packed nibble storage (packed_hs = logical/2).
+  // Dequant front-end fills ElementQ MMA fragments; TileShape D is logical
+  // head size (see decode uint8 dispatch ShapeQK[..., _128]).
   static constexpr bool Int4KV = is_same_v<ElementK, uint8_t>;
   static constexpr bool LocalMask = LocalMask_;
 
@@ -940,12 +940,31 @@ struct DecodeFwdMainloop<
   }
 
   CUTLASS_HOST_DEVICE static bool can_implement(Arguments const& args) {
-    // Cute MMA Int4KV not linked yet — M1 uses paged_decode_int4 SYCL path.
     if constexpr (Int4KV) {
-      return false;
+      // Host enforces hd=128 / packed_hs=64; require scales + tile-aligned pages.
+      return args.scale_k != nullptr && args.scale_v != nullptr &&
+             args.page_size > 0 &&
+             (args.page_size % static_cast<int>(get<1>(TileShapeQK{})) == 0) &&
+             args.scale_stride_page > 0;
     }
     (void)args;
     return true;
+  }
+
+  /// Per-token-head packed scale → (scale, zp) for physical KV row.
+  CUTLASS_DEVICE static vllm::xpu::int4_kv::ScaleZp load_int4_scale(
+      void const* scale_ptr,
+      int phys_k,
+      int kv_head,
+      Arguments const& params) {
+    int const block_id = phys_k / params.page_stride_elements;
+    int const slot = phys_k % params.page_size;
+    float const packed =
+        static_cast<float const*>(scale_ptr)
+            [block_id * params.scale_stride_page +
+             slot * params.scale_stride_seq +
+             kv_head * params.scale_stride_heads];
+    return vllm::xpu::int4_kv::unpack_scale_zp(packed);
   }
 
   template <bool has_large_surface, typename QVCoord>
@@ -964,7 +983,8 @@ struct DecodeFwdMainloop<
       int thr_id,
       int seq_len,
       int full_tile_offset,
-      int discard_seq_coord) {
+      int discard_seq_coord,
+      int kv_head = 0) {
     using namespace sycl::ext::oneapi::this_work_item;
 
     // Short dimension names:
@@ -982,8 +1002,23 @@ struct DecodeFwdMainloop<
     /* 64B-align the per-head block-2D surfaces (see block_2d_align.hpp) */
     int x_shift_q, x_shift_k, x_shift_v;
     auto Q_2D_al = align_block_2d_base<1>(Q_2D, x_shift_q);
-    auto K_2D_al = align_block_2d_base<1>(K_2D, x_shift_k);
-    auto V_2D_al = align_block_2d_base<0>(V_2D, x_shift_v);
+    // Int4KV: skip K/V 2D-align — loads are scalar dequant via d/2 addressing.
+    auto K_2D_al = [&]() {
+      if constexpr (Int4KV) {
+        x_shift_k = 0;
+        return K_2D;
+      } else {
+        return align_block_2d_base<1>(K_2D, x_shift_k);
+      }
+    }();
+    auto V_2D_al = [&]() {
+      if constexpr (Int4KV) {
+        x_shift_v = 0;
+        return V_2D;
+      } else {
+        return align_block_2d_base<0>(V_2D, x_shift_v);
+      }
+    }();
 
     /* Create proxy coordinate tensors for Q/K/P/V */
     Tensor cQ =
@@ -1229,11 +1264,15 @@ struct DecodeFwdMainloop<
     };
 
     if constexpr (has_large_surface) {
-      update_surface_info(tile_idx);
+      if constexpr (!Int4KV) {
+        update_surface_info(tile_idx);
+      }
     }
 
-    for (int D = 0; D < size<4>(pKgK); D++) {
-      prefetch(prefetch_k, pKgK(_, _, _, tile_idx, D));
+    if constexpr (!Int4KV) {
+      for (int D = 0; D < size<4>(pKgK); D++) {
+        prefetch(prefetch_k, pKgK(_, _, _, tile_idx, D));
+      }
     }
 
     clear(tArA);
@@ -1249,6 +1288,7 @@ struct DecodeFwdMainloop<
     // O = sum P_i·V_i is linear in V), but removes both rescales from the
     // inner loop. The remaining fp8 -> ElementQ conversion is performed by
     // reorder() using the subgroup-vectorized cast primitive.
+    // Int4KV: per-(token,head) scale/zp applied during dequant — do NOT fold.
     ElementS effective_scale = params.scale;
     float scale_v = 1.f;
     if constexpr (Fp8KV) {
@@ -1263,27 +1303,46 @@ struct DecodeFwdMainloop<
       /* Split barrier to keep threads together */
       // barrier_arrive(ScopeWorkgroup);
 
-      auto tKgK_cache =
-          PagedKV ? tKgK(_, _, _, tile_idx, _) : tKgK(_, _, _, K, _);
-      auto tVgV_cache =
-          PagedKV ? tVgV(_, _, _, _, tile_idx) : tVgV(_, _, _, _, K);
-
       /* GEMM 1: S = K * Q */
       clear(tSrS); /* TODO: fuse w/ initial gemm call */
       for (int D = 0; D < size<4>(tKgK); D++) {
         copy(copy_q, tQgQ(_, _, _, D), tQrQ);
-        copy(copy_k, tKgK_cache(_, _, _, D), tKrK);
-
         reorder(tQrQ, tSrQ);
-        // reorder() performs the (vectorized) fp8 -> ElementQ cast; the
-        // per-tensor scale_k has been folded into effective_scale above.
-        reorder(tKrK, tSrK);
+
+        if constexpr (Int4KV) {
+          // Dequant packed uint8 K (logical d via byte d/2) into ElementQ B.
+          auto tKcK = thr_mma_qk.partition_B(
+              PagedKV ? gK(_, _, tile_idx, D) : gK(_, _, K, D));
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < size(tSrK); ++i) {
+            int const k_pos = static_cast<int>(get<0>(tKcK(i)));
+            int const d_pos = static_cast<int>(get<1>(tKcK(i)));
+            auto const sz =
+                load_int4_scale(params.scale_k, k_pos, kv_head, params);
+            uint8_t const packed_b =
+                static_cast<uint8_t>(K_2D(k_pos, d_pos >> 1));
+            float even, odd;
+            vllm::xpu::int4_kv::dequant_byte(
+                packed_b, sz.scale, sz.zp, even, odd);
+            float const val = (d_pos & 1) ? odd : even;
+            tSrK(i) = static_cast<ElementQ>(val);
+          }
+        } else {
+          auto tKgK_cache =
+              PagedKV ? tKgK(_, _, _, tile_idx, _) : tKgK(_, _, _, K, _);
+          copy(copy_k, tKgK_cache(_, _, _, D), tKrK);
+          // reorder() performs the (vectorized) fp8 -> ElementQ cast; the
+          // per-tensor scale_k has been folded into effective_scale above.
+          reorder(tKrK, tSrK);
+        }
 
         cute::gemm(mma_qk, tSrQ, tSrK, tSrS);
       }
 
       /* V prefetch for GEMM 2 */
-      prefetch(prefetch_v, pVgV(_, _, _, tile_idx));
+      if constexpr (!Int4KV) {
+        prefetch(prefetch_v, pVgV(_, _, _, tile_idx));
+      }
 
       /* Causal masking */
       // No Causal masking in decoding
@@ -1346,10 +1405,32 @@ struct DecodeFwdMainloop<
       /* GEMM 2: A += P * V, split in v dimension */
       CUTLASS_PRAGMA_UNROLL
       for (int VV = 0; VV < VTiles; VV++) {
-        copy(copy_v, tVgV_cache(_, _, _, VV), tVrV);
-        // reorder() performs the (vectorized) fp8 -> ElementQ cast; the
-        // per-tensor scale_v is applied once after the K loop below.
-        reorder(tVrV, tArV);
+        if constexpr (Int4KV) {
+          auto tVcV = thr_mma_pv.partition_B(
+              PagedKV ? gV_split(_, _, VV, tile_idx)
+                      : gV_split(_, _, VV, K));
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < size(tArV); ++i) {
+            int const v_pos = static_cast<int>(get<0>(tVcV(i)));
+            int const k_pos = static_cast<int>(get<1>(tVcV(i)));
+            auto const sz =
+                load_int4_scale(params.scale_v, k_pos, kv_head, params);
+            uint8_t const packed_b =
+                static_cast<uint8_t>(V_2D(v_pos >> 1, k_pos));
+            float even, odd;
+            vllm::xpu::int4_kv::dequant_byte(
+                packed_b, sz.scale, sz.zp, even, odd);
+            float const val = (v_pos & 1) ? odd : even;
+            tArV(i) = static_cast<ElementQ>(val);
+          }
+        } else {
+          auto tVgV_cache =
+              PagedKV ? tVgV(_, _, _, _, tile_idx) : tVgV(_, _, _, _, K);
+          copy(copy_v, tVgV_cache(_, _, _, VV), tVrV);
+          // reorder() performs the (vectorized) fp8 -> ElementQ cast; the
+          // per-tensor scale_v is applied once after the K loop below.
+          reorder(tVrV, tArV);
+        }
         cute::gemm(mma_pv, tArP, tArV, tArA(_, _, _, VV));
       }
 
@@ -1373,12 +1454,16 @@ struct DecodeFwdMainloop<
       tile_idx = next_tile_idx;
 
       if constexpr (has_large_surface) {
-        update_surface_info(tile_idx);
+        if constexpr (!Int4KV) {
+          update_surface_info(tile_idx);
+        }
       }
 
       /* K prefetch */
-      for (int D = 0; D < size<4>(pKgK); D++) {
-        prefetch(prefetch_k, pKgK(_, _, _, tile_idx, D));
+      if constexpr (!Int4KV) {
+        for (int D = 0; D < size<4>(pKgK); D++) {
+          prefetch(prefetch_k, pKgK(_, _, _, tile_idx, D));
+        }
       }
 
       // barrier_wait(ScopeWorkgroup);

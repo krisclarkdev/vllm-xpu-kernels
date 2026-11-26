@@ -17,7 +17,7 @@ enum class CutlassDType {
   bfloat16,
   float8_e4m3,
   float8_e5m2,
-  uint8  // packed int4-KV storage (M1+); not a Cute MMA ElementK yet
+  uint8  // packed int4-KV storage; Cute DecodeFwdMainloop::Int4KV ElementK
 };
 
 // Struct to carry separate Q and K dtypes without breaking existing API

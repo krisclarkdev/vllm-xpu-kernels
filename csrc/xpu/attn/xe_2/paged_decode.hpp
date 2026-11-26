@@ -163,6 +163,10 @@ struct paged_decode_args_t {
   // pass), otherwise by the ReduceSplitK kernel.
   float* softmax_lse = nullptr;
   int lse_stride = 0;  // stride along the head dim (= total_seqlen_q)
+  // Int4 per-token-head scale strides (elements). Zero unless int4 KV.
+  int scale_stride_page = 0;
+  int scale_stride_seq = 0;
+  int scale_stride_heads = 0;
 };
 
 template <class FMHAKernel, class ReductionSplitKernel, bool isVarLen>
@@ -351,7 +355,10 @@ struct DecodeKernelLauncher {
          args.window_size_right,
          // page_stride_elements: physical stride between paged blocks in
          // seq-position units. It includes interleaved and cross-layer gaps.
-         args.page_stride_elements},
+         args.page_stride_elements,
+         args.scale_stride_page,
+         args.scale_stride_seq,
+         args.scale_stride_heads},
         {},
         hw_info,
         args.num_kv_splits};
@@ -704,6 +711,73 @@ void decode_policy_dispatch_impl(
       static_cast<int>(cuQKType.q_type),
       " k_type=",
       static_cast<int>(cuQKType.k_type));
+}
+
+/// Int4-KV Cute/DPAS launch (hd=128, page tile 64). Instantiates only the
+/// q8/q16 h128 p64 policies so general dtype dispatch stays lean.
+template <bool Causal, bool Local, bool Sink, typename ElementQ>
+inline void decode_int4_kernel_dispatch(
+    sycl::queue& queue,
+    const paged_decode_args_t& args,
+    int q_group) {
+  constexpr int PipelineStages = 1;
+  if (q_group <= 8) {
+    return PagedDecodeConfig<
+        typename decode_policy_q8_h128_p64::ShapeQK,
+        typename decode_policy_q8_h128_p64::ShapePV,
+        typename decode_policy_q8_h128_p64::ShapeOut,
+        typename decode_policy_q8_h128_p64::SubgroupLayoutQK,
+        void,
+        PipelineStages,
+        Causal,
+        Local,
+        Sink,
+        ElementQ,
+        uint8_t,
+        uint8_t,
+        ElementQ>::kernel_dispatch(queue, args);
+  }
+  return PagedDecodeConfig<
+      typename decode_policy_q16_h128_p64::ShapeQK,
+      typename decode_policy_q16_h128_p64::ShapePV,
+      typename decode_policy_q16_h128_p64::ShapeOut,
+      typename decode_policy_q16_h128_p64::SubgroupLayoutQK,
+      void,
+      PipelineStages,
+      Causal,
+      Local,
+      Sink,
+      ElementQ,
+      uint8_t,
+      uint8_t,
+      ElementQ>::kernel_dispatch(queue, args);
+}
+
+template <typename ElementQ>
+inline void decode_int4_dispatch_q(
+    sycl::queue& queue,
+    const paged_decode_args_t& args) {
+  const int q_group = args.num_heads_q / args.num_heads_k;
+  // Decode API forces is_causal=false; sink unsupported for int4. Keep local.
+  if (args.is_local) {
+    return decode_int4_kernel_dispatch<false, true, false, ElementQ>(
+        queue, args, q_group);
+  }
+  return decode_int4_kernel_dispatch<false, false, false, ElementQ>(
+      queue, args, q_group);
+}
+
+inline void decode_int4_dispatch(
+    sycl::queue& queue,
+    CutlassQKType& cuQKType,
+    const paged_decode_args_t& args) {
+  if (cuQKType.q_type == CutlassDType::half) {
+    return decode_int4_dispatch_q<half_t>(queue, args);
+  }
+  if (cuQKType.q_type == CutlassDType::bfloat16) {
+    return decode_int4_dispatch_q<bfloat16_t>(queue, args);
+  }
+  TORCH_CHECK(false, "int4 Cute paged_decode: Q must be fp16 or bf16");
 }
 
 }  // namespace vllm::xpu::xe2

@@ -485,7 +485,8 @@ std::vector<at::Tensor> mha_varlen_fwd(
           q.options().dtype(out_dtype).device(q.device()));
     }
 
-    // M1 int4 SYCL path has no split-K; force 1. Fp16/fp8 keep the tuner.
+    // Int4 Cute path: keep splits=1 until split-K + dequant FE is proven.
+    // Fp16/fp8 keep the tuner. M1 SYCL rollback also requires splits=1.
     int num_kv_splits =
         is_int4_kv
             ? 1
