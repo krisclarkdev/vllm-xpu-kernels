@@ -1314,7 +1314,7 @@ struct DecodeFwdMainloop<
           auto tKcK = thr_mma_qk.partition_B(
               PagedKV ? gK(_, _, tile_idx, D) : gK(_, _, K, D));
           CUTLASS_PRAGMA_UNROLL
-          for (int i = 0; i < size(tSrK); ++i) {
+          for (int i = 0; i < tSrK.size(); ++i) {
             int const k_pos = static_cast<int>(get<0>(tKcK(i)));
             int const d_pos = static_cast<int>(get<1>(tKcK(i)));
             auto const sz =
@@ -1410,7 +1410,7 @@ struct DecodeFwdMainloop<
               PagedKV ? gV_split(_, _, VV, tile_idx)
                       : gV_split(_, _, VV, K));
           CUTLASS_PRAGMA_UNROLL
-          for (int i = 0; i < size(tArV); ++i) {
+          for (int i = 0; i < tArV.size(); ++i) {
             int const v_pos = static_cast<int>(get<0>(tVcV(i)));
             int const k_pos = static_cast<int>(get<1>(tVcV(i)));
             auto const sz =
